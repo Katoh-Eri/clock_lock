@@ -1,0 +1,732 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <ESP32Servo.h>
+#include <LiquidCrystal_I2C.h>
+
+RTC_DS3231 rtc;
+Servo lockServo;
+LiquidCrystal_I2C lcd(0x27, 16, 2);   // nếu LCD không hiện, thử 0x3F
+WebServer server(80);
+
+// ===== AP Mode =====
+const char* apSSID = "ESP32_DOOR";
+const char* apPassword = "12345678";
+
+// ===== Chân ESP32 =====
+const int buttonManual = 16;
+const int buttonSet    = 17;
+const int encCLKPin    = 18;
+const int encDTPin     = 19;
+
+const int ledRed       = 25;
+const int ledGreen     = 26;
+const int servoPin     = 27;
+
+// I2C
+const int SDA_PIN = 21;
+const int SCL_PIN = 22;
+
+// ===== Góc servo =====
+const int closeAngle = 90;
+const int openAngle  = 0;
+
+// ===== Thời gian CLOSE / OPEN =====
+int closeHour = 0;
+int closeMinute = 0;
+int closeSecond = 20;
+
+int openHour = 0;
+int openMinute = 0;
+int openSecond = 40;
+
+// ===== RTC set values =====
+int rtcSetHour = 0;
+int rtcSetMinute = 0;
+int rtcSetSecond = 0;
+
+// ===== Trạng thái cửa =====
+bool doorOpen = true;
+
+// ===== Debounce nút =====
+const unsigned long debounceDelay = 50;
+
+struct ButtonState {
+  int pin;
+  bool stableState;
+  bool lastReading;
+  unsigned long lastDebounceTime;
+};
+
+ButtonState btnManual = {buttonManual, HIGH, HIGH, 0};
+ButtonState btnSet    = {buttonSet,    HIGH, HIGH, 0};
+
+// ===== Setting =====
+enum SettingMode { SET_NONE, SET_CLOSE, SET_OPEN, SET_RTC };
+SettingMode settingMode = SET_NONE;
+
+enum EditField { FIELD_HOUR, FIELD_MINUTE, FIELD_SECOND };
+EditField editField = FIELD_HOUR;
+
+unsigned long lastActionTime = 0;
+
+// ===== Giữ nút setting =====
+bool setButtonHolding = false;
+unsigned long setHoldStart = 0;
+bool enteredBy3s = false;
+bool enteredBy6s = false;
+bool enteredBy10s = false;
+
+// ===== Encoder =====
+int lastEncoded = 0;
+long encoderValue = 0;
+
+// ===== LCD refresh =====
+int lastShownSecond = -1;
+unsigned long lastBottomToggle = 0;
+bool showNextClose = true;
+
+unsigned long lastBlinkMillis = 0;
+bool blinkState = true;
+
+// ===== Chống trigger lặp trong cùng 1 giây =====
+int lastTriggeredSecondClose = -1;
+int lastTriggeredMinuteClose = -1;
+int lastTriggeredHourClose   = -1;
+
+int lastTriggeredSecondOpen = -1;
+int lastTriggeredMinuteOpen = -1;
+int lastTriggeredHourOpen   = -1;
+
+// --------------------------------------------------
+bool isButtonPressed(ButtonState &btn) {
+  bool reading = digitalRead(btn.pin);
+
+  if (reading != btn.lastReading) {
+    btn.lastDebounceTime = millis();
+    btn.lastReading = reading;
+  }
+
+  if ((millis() - btn.lastDebounceTime) > debounceDelay) {
+    if (reading != btn.stableState) {
+      btn.stableState = reading;
+      if (btn.stableState == LOW) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+int wrap24(int value) {
+  while (value < 0) value += 24;
+  while (value >= 24) value -= 24;
+  return value;
+}
+
+int wrap60(int value) {
+  while (value < 0) value += 60;
+  while (value >= 60) value -= 60;
+  return value;
+}
+
+void setDoorOpen(bool openState) {
+  doorOpen = openState;
+
+  if (doorOpen) {
+    lockServo.write(openAngle);
+    digitalWrite(ledGreen, HIGH);
+    digitalWrite(ledRed, LOW);
+  } else {
+    lockServo.write(closeAngle);
+    digitalWrite(ledGreen, LOW);
+    digitalWrite(ledRed, HIGH);
+  }
+}
+
+void lcdPrint2(int value) {
+  if (value < 10) lcd.print("0");
+  lcd.print(value);
+}
+
+void saveRTCFromSetting() {
+  DateTime now = rtc.now();
+  rtc.adjust(DateTime(now.year(), now.month(), now.day(),
+                      wrap24(rtcSetHour), wrap60(rtcSetMinute), wrap60(rtcSetSecond)));
+}
+
+void setRTCFromValues(int h, int m, int s) {
+  DateTime now = rtc.now();
+  rtc.adjust(DateTime(now.year(), now.month(), now.day(),
+                      wrap24(h), wrap60(m), wrap60(s)));
+}
+
+void updateTopLine() {
+  lcd.setCursor(0, 0);
+  lcd.print("                ");
+  lcd.setCursor(0, 0);
+
+  if (settingMode == SET_CLOSE) {
+    lcd.print("SETTING CL");
+  }
+  else if (settingMode == SET_OPEN) {
+    lcd.print("SETTING OP");
+  }
+  else if (settingMode == SET_RTC) {
+    lcd.print("SETTING RTC");
+  }
+  else {
+    DateTime now = rtc.now();
+    lcdPrint2(now.hour());
+    lcd.print(":");
+    lcdPrint2(now.minute());
+    lcd.print(":");
+    lcdPrint2(now.second());
+    lcd.print(" ");
+    lcd.print(doorOpen ? "OPEN" : "CLOSE");
+  }
+}
+
+void printFieldWithBlink(int value, bool selected) {
+  if (selected && !blinkState) {
+    lcd.print("  ");
+  } else {
+    lcdPrint2(value);
+  }
+}
+
+void updateBottomLine() {
+  lcd.setCursor(0, 1);
+  lcd.print("                ");
+  lcd.setCursor(0, 1);
+
+  if (settingMode != SET_NONE) {
+    int h, m, s;
+
+    if (settingMode == SET_CLOSE) {
+      h = closeHour;
+      m = closeMinute;
+      s = closeSecond;
+    }
+    else if (settingMode == SET_OPEN) {
+      h = openHour;
+      m = openMinute;
+      s = openSecond;
+    }
+    else {
+      h = rtcSetHour;
+      m = rtcSetMinute;
+      s = rtcSetSecond;
+    }
+
+    printFieldWithBlink(h, editField == FIELD_HOUR);
+    lcd.print(":");
+    printFieldWithBlink(m, editField == FIELD_MINUTE);
+    lcd.print(":");
+    printFieldWithBlink(s, editField == FIELD_SECOND);
+  }
+  else {
+    if (showNextClose) {
+      lcdPrint2(closeHour);
+      lcd.print(":");
+      lcdPrint2(closeMinute);
+      lcd.print(":");
+      lcdPrint2(closeSecond);
+      lcd.print(" NEXT CL");
+    } else {
+      lcdPrint2(openHour);
+      lcd.print(":");
+      lcdPrint2(openMinute);
+      lcd.print(":");
+      lcdPrint2(openSecond);
+      lcd.print(" NEXT OP");
+    }
+  }
+}
+
+void updateLCD() {
+  updateTopLine();
+  updateBottomLine();
+}
+
+void adjustValue(int delta) {
+  int *target = nullptr;
+
+  if (settingMode == SET_CLOSE) {
+    if (editField == FIELD_HOUR)   target = &closeHour;
+    if (editField == FIELD_MINUTE) target = &closeMinute;
+    if (editField == FIELD_SECOND) target = &closeSecond;
+  }
+  else if (settingMode == SET_OPEN) {
+    if (editField == FIELD_HOUR)   target = &openHour;
+    if (editField == FIELD_MINUTE) target = &openMinute;
+    if (editField == FIELD_SECOND) target = &openSecond;
+  }
+  else if (settingMode == SET_RTC) {
+    if (editField == FIELD_HOUR)   target = &rtcSetHour;
+    if (editField == FIELD_MINUTE) target = &rtcSetMinute;
+    if (editField == FIELD_SECOND) target = &rtcSetSecond;
+  }
+
+  if (target != nullptr) {
+    if (editField == FIELD_HOUR) {
+      *target = wrap24(*target + delta);
+    } else {
+      *target = wrap60(*target + delta);
+    }
+  }
+}
+
+void handleEncoderRotation() {
+  int MSB = digitalRead(encCLKPin);
+  int LSB = digitalRead(encDTPin);
+
+  int encoded = (MSB << 1) | LSB;
+  int sum = (lastEncoded << 2) | encoded;
+
+  if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) {
+    encoderValue++;
+  }
+
+  if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) {
+    encoderValue--;
+  }
+
+  if (encoderValue >= 4) {
+    if (settingMode != SET_NONE) {
+      adjustValue(+1);
+      lastActionTime = millis();
+      updateBottomLine();
+    }
+    encoderValue = 0;
+  }
+  else if (encoderValue <= -4) {
+    if (settingMode != SET_NONE) {
+      adjustValue(-1);
+      lastActionTime = millis();
+      updateBottomLine();
+    }
+    encoderValue = 0;
+  }
+
+  lastEncoded = encoded;
+}
+
+void handleSetHold() {
+  bool pressed = (digitalRead(buttonSet) == LOW);
+
+  if (pressed) {
+    if (!setButtonHolding) {
+      setButtonHolding = true;
+      setHoldStart = millis();
+      enteredBy3s = false;
+      enteredBy6s = false;
+      enteredBy10s = false;
+    }
+
+    unsigned long holdTime = millis() - setHoldStart;
+
+    if (!enteredBy3s && holdTime >= 3000) {
+      settingMode = SET_CLOSE;
+      editField = FIELD_HOUR;
+      lastActionTime = millis();
+      enteredBy3s = true;
+      updateLCD();
+    }
+
+    if (!enteredBy6s && holdTime >= 6000) {
+      settingMode = SET_OPEN;
+      editField = FIELD_HOUR;
+      lastActionTime = millis();
+      enteredBy6s = true;
+      updateLCD();
+    }
+
+    if (!enteredBy10s && holdTime >= 10000) {
+      DateTime now = rtc.now();
+      rtcSetHour = now.hour();
+      rtcSetMinute = now.minute();
+      rtcSetSecond = now.second();
+
+      settingMode = SET_RTC;
+      editField = FIELD_HOUR;
+      lastActionTime = millis();
+      enteredBy10s = true;
+      updateLCD();
+    }
+  } else {
+    setButtonHolding = false;
+  }
+}
+
+void handleSetShortPress() {
+  if (!isButtonPressed(btnSet)) return;
+  if (settingMode == SET_NONE) return;
+
+  lastActionTime = millis();
+
+  if (editField == FIELD_HOUR) {
+    editField = FIELD_MINUTE;
+  }
+  else if (editField == FIELD_MINUTE) {
+    editField = FIELD_SECOND;
+  }
+  else {
+    if (settingMode == SET_CLOSE) {
+      closeHour = wrap24(closeHour);
+      closeMinute = wrap60(closeMinute);
+      closeSecond = wrap60(closeSecond);
+      settingMode = SET_NONE;
+    }
+    else if (settingMode == SET_OPEN) {
+      openHour = wrap24(openHour);
+      openMinute = wrap60(openMinute);
+      openSecond = wrap60(openSecond);
+      settingMode = SET_NONE;
+    }
+    else if (settingMode == SET_RTC) {
+      saveRTCFromSetting();
+      settingMode = SET_NONE;
+    }
+  }
+
+  updateLCD();
+}
+
+void handleSettingTimeout() {
+  if (settingMode != SET_NONE && (millis() - lastActionTime >= 5000)) {
+
+    if (settingMode == SET_CLOSE) {
+      closeHour = wrap24(closeHour);
+      closeMinute = wrap60(closeMinute);
+      closeSecond = wrap60(closeSecond);
+    }
+    else if (settingMode == SET_OPEN) {
+      openHour = wrap24(openHour);
+      openMinute = wrap60(openMinute);
+      openSecond = wrap60(openSecond);
+    }
+    else if (settingMode == SET_RTC) {
+      saveRTCFromSetting();
+    }
+
+    settingMode = SET_NONE;
+    updateLCD();
+  }
+}
+
+void handleAutoOpenClose() {
+  DateTime now = rtc.now();
+
+  if (settingMode != SET_NONE) return;
+
+  if (now.hour() == closeHour &&
+      now.minute() == closeMinute &&
+      now.second() == closeSecond) {
+
+    bool alreadyTriggeredThisSecond =
+      (lastTriggeredHourClose == now.hour() &&
+       lastTriggeredMinuteClose == now.minute() &&
+       lastTriggeredSecondClose == now.second());
+
+    if (!alreadyTriggeredThisSecond) {
+      if (doorOpen) {
+        setDoorOpen(false);
+        updateTopLine();
+      }
+
+      lastTriggeredHourClose = now.hour();
+      lastTriggeredMinuteClose = now.minute();
+      lastTriggeredSecondClose = now.second();
+    }
+  }
+
+  if (now.hour() == openHour &&
+      now.minute() == openMinute &&
+      now.second() == openSecond) {
+
+    bool alreadyTriggeredThisSecond =
+      (lastTriggeredHourOpen == now.hour() &&
+       lastTriggeredMinuteOpen == now.minute() &&
+       lastTriggeredSecondOpen == now.second());
+
+    if (!alreadyTriggeredThisSecond) {
+      if (!doorOpen) {
+        setDoorOpen(true);
+        updateTopLine();
+      }
+
+      lastTriggeredHourOpen = now.hour();
+      lastTriggeredMinuteOpen = now.minute();
+      lastTriggeredSecondOpen = now.second();
+    }
+  }
+}
+
+String getTimeString(int h, int m, int s) {
+  char buf[9];
+  sprintf(buf, "%02d:%02d:%02d", wrap24(h), wrap60(m), wrap60(s));
+  return String(buf);
+}
+
+bool parseTimeString(String t, int &h, int &m, int &s) {
+  if (t.length() != 8) return false;
+  if (t.charAt(2) != ':' || t.charAt(5) != ':') return false;
+
+  int hh = t.substring(0, 2).toInt();
+  int mm = t.substring(3, 5).toInt();
+  int ss = t.substring(6, 8).toInt();
+
+  if (hh < 0 || hh > 23) return false;
+  if (mm < 0 || mm > 59) return false;
+  if (ss < 0 || ss > 59) return false;
+
+  h = hh;
+  m = mm;
+  s = ss;
+  return true;
+}
+
+// --------------------------------------------------
+// WEB
+// --------------------------------------------------
+String htmlPage() {
+  DateTime now = rtc.now();
+
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Door Control</title>
+<style>
+body{font-family:Arial;margin:20px;background:#f4f6f8;color:#222;}
+.card{background:#fff;padding:16px;border-radius:14px;box-shadow:0 2px 10px rgba(0,0,0,.08);margin-bottom:16px;}
+h2{margin-top:0;}
+input{width:140px;padding:10px;font-size:16px;margin:6px 0;}
+button{padding:10px 14px;font-size:16px;border:none;border-radius:10px;margin:6px 6px 6px 0;cursor:pointer;}
+.open{background:#2ecc71;color:white;}
+.close{background:#e74c3c;color:white;}
+.save{background:#3498db;color:white;}
+.info{font-size:18px;margin:6px 0;}
+.small{color:#666;font-size:14px;}
+</style>
+</head>
+<body>
+<div class="card">
+<h2>ESP32 Door Control</h2>
+<div class="info"><b>RTC:</b> %RTC%</div>
+<div class="info"><b>Door:</b> %DOOR%</div>
+<div class="info"><b>Next OPEN:</b> %OPEN%</div>
+<div class="info"><b>Next CLOSE:</b> %CLOSE%</div>
+<div class="small">Format: HH:MM:SS (24h)</div>
+<div class="small">Connect WiFi: ESP32_DOOR / 12345678</div>
+<div class="small">Open in browser: 192.168.4.1</div>
+</div>
+
+<div class="card">
+<h2>Set OPEN time</h2>
+<form action="/setOpen" method="get">
+<input type="text" name="time" value="%OPEN%" maxlength="8">
+<br>
+<button class="save" type="submit">Save OPEN</button>
+</form>
+</div>
+
+<div class="card">
+<h2>Set CLOSE time</h2>
+<form action="/setClose" method="get">
+<input type="text" name="time" value="%CLOSE%" maxlength="8">
+<br>
+<button class="save" type="submit">Save CLOSE</button>
+</form>
+</div>
+
+<div class="card">
+<h2>Set RTC</h2>
+<form action="/setRTC" method="get">
+<input type="text" name="time" value="%RTC%" maxlength="8">
+<br>
+<button class="save" type="submit">Save RTC</button>
+</form>
+</div>
+
+<div class="card">
+<h2>Manual Control</h2>
+<a href="/openNow"><button class="open">OPEN NOW</button></a>
+<a href="/closeNow"><button class="close">CLOSE NOW</button></a>
+</div>
+</body>
+</html>
+)rawliteral";
+
+  html.replace("%RTC%", getTimeString(now.hour(), now.minute(), now.second()));
+  html.replace("%DOOR%", doorOpen ? "OPEN" : "CLOSE");
+  html.replace("%OPEN%", getTimeString(openHour, openMinute, openSecond));
+  html.replace("%CLOSE%", getTimeString(closeHour, closeMinute, closeSecond));
+
+  return html;
+}
+
+void handleRoot() {
+  server.send(200, "text/html", htmlPage());
+}
+
+void handleSetOpen() {
+  if (server.hasArg("time")) {
+    int h, m, s;
+    if (parseTimeString(server.arg("time"), h, m, s)) {
+      openHour = h;
+      openMinute = m;
+      openSecond = s;
+      updateLCD();
+    }
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleSetClose() {
+  if (server.hasArg("time")) {
+    int h, m, s;
+    if (parseTimeString(server.arg("time"), h, m, s)) {
+      closeHour = h;
+      closeMinute = m;
+      closeSecond = s;
+      updateLCD();
+    }
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleSetRTC() {
+  if (server.hasArg("time")) {
+    int h, m, s;
+    if (parseTimeString(server.arg("time"), h, m, s)) {
+      setRTCFromValues(h, m, s);
+      updateLCD();
+    }
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleOpenNow() {
+  setDoorOpen(true);
+  updateLCD();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleCloseNow() {
+  setDoorOpen(false);
+  updateLCD();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void setupWebAP() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(apSSID, apPassword);
+
+  IPAddress IP = WiFi.softAPIP();
+
+  server.on("/", handleRoot);
+  server.on("/setOpen", handleSetOpen);
+  server.on("/setClose", handleSetClose);
+  server.on("/setRTC", handleSetRTC);
+  server.on("/openNow", handleOpenNow);
+  server.on("/closeNow", handleCloseNow);
+  server.begin();
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("AP: ESP32_DOOR");
+  lcd.setCursor(0, 1);
+  lcd.print(IP.toString());
+  delay(3000);
+}
+
+void setup() {
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  pinMode(buttonManual, INPUT_PULLUP);
+  pinMode(buttonSet, INPUT_PULLUP);
+  pinMode(encCLKPin, INPUT_PULLUP);
+  pinMode(encDTPin, INPUT_PULLUP);
+
+  pinMode(ledRed, OUTPUT);
+  pinMode(ledGreen, OUTPUT);
+
+  lockServo.setPeriodHertz(50);
+  lockServo.attach(servoPin, 500, 2400);
+
+  if (!rtc.begin()) {
+    while (1);
+  }
+
+  lcd.begin(16, 2);
+  lcd.backlight();
+  lcd.clear();
+
+  DateTime now = rtc.now();
+
+  closeHour = now.hour();
+  closeMinute = now.minute();
+  closeSecond = (now.second() + 20) % 60;
+
+  openHour = now.hour();
+  openMinute = now.minute();
+  openSecond = (now.second() + 40) % 60;
+
+  rtcSetHour = now.hour();
+  rtcSetMinute = now.minute();
+  rtcSetSecond = now.second();
+
+  setDoorOpen(true);
+
+  int MSB = digitalRead(encCLKPin);
+  int LSB = digitalRead(encDTPin);
+  lastEncoded = (MSB << 1) | LSB;
+
+  setupWebAP();
+  updateLCD();
+}
+
+void loop() {
+  DateTime now = rtc.now();
+
+  server.handleClient();
+
+  if (isButtonPressed(btnManual) && settingMode == SET_NONE) {
+    setDoorOpen(!doorOpen);
+    updateTopLine();
+  }
+
+  handleSetHold();
+  handleSetShortPress();
+  handleEncoderRotation();
+  handleSettingTimeout();
+  handleAutoOpenClose();
+
+  if (settingMode != SET_NONE && millis() - lastBlinkMillis >= 300) {
+    lastBlinkMillis = millis();
+    blinkState = !blinkState;
+    updateBottomLine();
+  }
+
+  if (now.second() != lastShownSecond && settingMode == SET_NONE) {
+    lastShownSecond = now.second();
+    updateTopLine();
+  }
+
+  if (settingMode == SET_NONE && millis() - lastBottomToggle >= 3000) {
+    lastBottomToggle = millis();
+    showNextClose = !showNextClose;
+    updateBottomLine();
+  }
+
+  delay(2);
+}
